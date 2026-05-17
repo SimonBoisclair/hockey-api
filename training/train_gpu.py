@@ -460,19 +460,23 @@ class VecHockeyEnv:
 class PolicyNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(NUM_FEATURES, 64)
-        self.fc2 = nn.Linear(64, 32)
-        self.fc3 = nn.Linear(32, NUM_ACTIONS)
+        self.fc1 = nn.Linear(NUM_FEATURES, 512)
+        self.fc2 = nn.Linear(512, 512)
+        self.fc3 = nn.Linear(512, 256)
+        self.fc4 = nn.Linear(256, 128)
+        self.fc5 = nn.Linear(128, NUM_ACTIONS)
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        return F.softmax(self.fc3(x), dim=-1)
+        x = F.relu(self.fc3(x))
+        x = F.relu(self.fc4(x))
+        return F.softmax(self.fc5(x), dim=-1)
 
     def serialize_for_frontend(self):
         """Serialize weights in the same JSON format the frontend expects."""
         layers = []
-        for layer in [self.fc1, self.fc2, self.fc3]:
+        for layer in [self.fc1, self.fc2, self.fc3, self.fc4, self.fc5]:
             layers.append({
                 "weights": layer.weight.detach().cpu().tolist(),
                 "biases": layer.bias.detach().cpu().tolist(),
