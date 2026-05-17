@@ -319,6 +319,9 @@ class VecHockeyEnv:
         # Player-player collision
         self._player_collision(active)
 
+        # Non-carrier cannot enter more than half body into goal zone
+        self._enforce_goal_zone(active)
+
         # Backcheck
         for pi in range(2):
             bc = self.must_bc[:, pi] & active
@@ -464,6 +467,24 @@ class VecHockeyEnv:
         self.pos[:, 1] = torch.where(cu, np1, self.pos[:, 1])
         self.vel[:, 0] = torch.where(cu, nv0, self.vel[:, 0])
         self.vel[:, 1] = torch.where(cu, nv1, self.vel[:, 1])
+
+    def _enforce_goal_zone(self, active):
+        """Non-carrier cannot enter more than half body into goal zone."""
+        goal_zone_x = RINK_W - GOAL_D
+        goal_y_lo = (RINK_H - GOAL_W) / 2
+        goal_y_hi = goal_y_lo + GOAL_W
+        for pi in range(2):
+            is_non_carrier = active & (self.poss != pi)
+            in_y = is_non_carrier & (self.pos[:, pi, 1] >= goal_y_lo) & (self.pos[:, pi, 1] <= goal_y_hi)
+            past_x = in_y & (self.pos[:, pi, 0] > goal_zone_x)
+            if past_x.any():
+                self.pos[:, pi, 0] = torch.where(past_x,
+                    torch.full_like(self.pos[:, pi, 0], goal_zone_x),
+                    self.pos[:, pi, 0])
+                self.vel[:, pi, 0] = torch.where(
+                    past_x & (self.vel[:, pi, 0] > 0),
+                    torch.zeros_like(self.vel[:, pi, 0]),
+                    self.vel[:, pi, 0])
 
     def _check_goals(self, active):
         cp = torch.where(self.poss.unsqueeze(-1) == 0, self.pos[:, 0], self.pos[:, 1])
