@@ -338,6 +338,16 @@ async def report_training_progress(report: TrainingReport):
         "model_name": report.model_name,
         "last_report": datetime.now(timezone.utc).isoformat(),
     })
+
+    # Auto-terminate pod when training completes or errors
+    if report.status and report.status.startswith(("completed", "error")) and current_pod:
+        try:
+            query = 'mutation { podTerminate(input: { podId: "%s" }) }' % current_pod
+            runpod_gql(query)
+            training_status["pod_terminated"] = True
+        except Exception:
+            pass
+
     return {"status": "ok"}
 
 
