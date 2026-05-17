@@ -50,13 +50,13 @@ DT = 1.0 / 60.0
 GOAL_DISPLAY = 0.05  # minimal for training (instant reset)
 
 # ── AI Constants ──
-NUM_FEATURES = 13
+NUM_FEATURES = 20
 NUM_ACTIONS = 10
 DECISION_BUDGET = 5.0
 BUDGET_WINDOW = 600.0
 BUDGET_REFILL = DECISION_BUDGET / BUDGET_WINDOW
 MOVE_DIST = 12.0
-MAX_STEPS = 900
+MAX_STEPS = 1800
 GAMMA = 0.99
 LR = 0.003
 INACTIVITY_TH = 300  # 5 seconds at 60fps
@@ -128,8 +128,37 @@ class VecHockeyEnv:
         self.steps_since[mask] = 0
         self.last_act[mask] = 9
 
+    def _compute_steal_chance(self, pi):
+        """Compute steal chance for player pi [N] based on distance + direction."""
+        oi = 1 - pi
+        has_puck = (self.poss == pi)
+        locked = self.steal_tmr[:, pi] > 0
+        me_p = self.pos[:, pi]
+        carrier_p = torch.where(self.poss.unsqueeze(-1) == 0, self.pos[:, 0], self.pos[:, 1])
+        dist = torch.norm(me_p - carrier_p, dim=-1)
+
+        # Base chance from distance
+        t = ((dist - STEAL_MIN_D) / (STEAL_MAX_D - STEAL_MIN_D)).clamp(0, 1)
+        chance = STEAL_CHANCE_NEAR + t * (STEAL_CHANCE_FAR - STEAL_CHANCE_NEAR)
+
+        # Directional modifier
+        carrier_v = torch.where(self.poss.unsqueeze(-1) == 0, self.vel[:, 0], self.vel[:, 1])
+        c_speed = torch.norm(carrier_v, dim=-1)
+        has_speed = c_speed > MIN_SPEED
+        to_s = me_p - carrier_p
+        to_s_n = to_s / (torch.norm(to_s, dim=-1, keepdim=True) + 1e-8)
+        c_dir = carrier_v / (c_speed.unsqueeze(-1) + 1e-8)
+        dot = (c_dir * to_s_n).sum(dim=-1)
+        d_mod = torch.where(dot > 0, dot * STEAL_DIR_BONUS, dot * STEAL_DIR_PENALTY)
+        chance = torch.where(has_speed, (chance + d_mod).clamp(0.05, 0.85), chance)
+
+        # Zero out if has puck, out of range, or locked
+        chance = torch.where(has_puck | (dist > STEAL_MAX_D) | locked,
+                             torch.zeros_like(chance), chance)
+        return chance
+
     def get_obs(self):
-        """Return observations [N, 2, 13] for both players."""
+        """Return observations [N, 2, 20] for both players."""
         obs = torch.zeros(self.N, 2, NUM_FEATURES, device=device)
         goal_x = RINK_W - GOAL_D / 2
         goal_y = RINK_H / 2
@@ -152,6 +181,23 @@ class VecHockeyEnv:
             obs[:, pi, 10] = (goal_x - me_p[:, 0]) / RINK_W
             obs[:, pi, 11] = (goal_y - me_p[:, 1]) / RINK_H
             obs[:, pi, 12] = torch.norm(me_p - op_p, dim=-1) / RINK_W
+            # New features
+            # Destination (use current pos if no destination)
+            has_d = self.has_dest[:, pi].float()
+            obs[:, pi, 13] = torch.where(self.has_dest[:, pi],
+                self.dest[:, pi, 0] / RINK_W, me_p[:, 0] / RINK_W)
+            obs[:, pi, 14] = torch.where(self.has_dest[:, pi],
+                self.dest[:, pi, 1] / RINK_H, me_p[:, 1] / RINK_H)
+            # Decision budget (normalized)
+            obs[:, pi, 15] = self.tokens[:, pi] / DECISION_BUDGET
+            # isLocked
+            obs[:, pi, 16] = self.lock_dir[:, pi].float()
+            # Steal chance
+            obs[:, pi, 17] = self._compute_steal_chance(pi)
+            # Opponent hasPuck
+            obs[:, pi, 18] = (self.poss != pi).float()
+            # Opponent isLocked
+            obs[:, pi, 19] = self.lock_dir[:, oi].float()
         return obs
 
     def apply_actions(self, actions, can_decide):
@@ -272,6 +318,9 @@ class VecHockeyEnv:
 
         # Player-player collision
         self._player_collision(active)
+
+        # Non-carrier cannot enter more than half body into goal zone
+        self._enforce_goal_zone(active)
 
         # Backcheck
         for pi in range(2):
@@ -419,6 +468,24 @@ class VecHockeyEnv:
         self.vel[:, 0] = torch.where(cu, nv0, self.vel[:, 0])
         self.vel[:, 1] = torch.where(cu, nv1, self.vel[:, 1])
 
+    def _enforce_goal_zone(self, active):
+        """Non-carrier cannot enter more than half body into goal zone."""
+        goal_zone_x = RINK_W - GOAL_D
+        goal_y_lo = (RINK_H - GOAL_W) / 2
+        goal_y_hi = goal_y_lo + GOAL_W
+        for pi in range(2):
+            is_non_carrier = active & (self.poss != pi)
+            in_y = is_non_carrier & (self.pos[:, pi, 1] >= goal_y_lo) & (self.pos[:, pi, 1] <= goal_y_hi)
+            past_x = in_y & (self.pos[:, pi, 0] > goal_zone_x)
+            if past_x.any():
+                self.pos[:, pi, 0] = torch.where(past_x,
+                    torch.full_like(self.pos[:, pi, 0], goal_zone_x),
+                    self.pos[:, pi, 0])
+                self.vel[:, pi, 0] = torch.where(
+                    past_x & (self.vel[:, pi, 0] > 0),
+                    torch.zeros_like(self.vel[:, pi, 0]),
+                    self.vel[:, pi, 0])
+
     def _check_goals(self, active):
         cp = torch.where(self.poss.unsqueeze(-1) == 0, self.pos[:, 0], self.pos[:, 1])
         c_bc = torch.where(self.poss == 0, self.must_bc[:, 0], self.must_bc[:, 1])
@@ -551,7 +618,7 @@ def main():
         stored_rewards = []
         stored_masks = []
 
-        # ── Rollout: 900 steps with no_grad (physics + action selection) ──
+        # ── Rollout: 1800 steps with no_grad (physics + action selection) ──
         with torch.no_grad():
             for step in range(MAX_STEPS):
                 # Decision budget
@@ -560,8 +627,8 @@ def main():
                 can_decide = (env.tokens >= 1.0) & (env.steps_since >= 2)
 
                 # Observations
-                obs = env.get_obs()  # [N, 2, 13]
-                obs_flat = obs.reshape(-1, NUM_FEATURES)  # [N*2, 13]
+                obs = env.get_obs()  # [N, 2, 20]
+                obs_flat = obs.reshape(-1, NUM_FEATURES)  # [N*2, 20]
 
                 # Forward pass
                 probs = net(obs_flat)  # [N*2, 10]
@@ -620,7 +687,7 @@ def main():
                 stored_rewards.append(rewards.reshape(-1).clone())
 
         # ── Compute discounted returns ──
-        rewards_t = torch.stack(stored_rewards)  # [900, N*2]
+        rewards_t = torch.stack(stored_rewards)  # [1800, N*2]
         returns = torch.zeros_like(rewards_t)
         G = torch.zeros(N * 2, device=device)
         for t in range(MAX_STEPS - 1, -1, -1):
@@ -631,9 +698,9 @@ def main():
         adv = (returns - returns.mean()) / (returns.std() + 1e-8)
 
         # ── Policy update: re-compute log_probs with gradients ──
-        all_obs = torch.stack(stored_obs)      # [900, N*2, 13]
-        all_acts = torch.stack(stored_actions)  # [900, N*2]
-        all_masks = torch.stack(stored_masks)   # [900, N*2]
+        all_obs = torch.stack(stored_obs)      # [1800, N*2, 20]
+        all_acts = torch.stack(stored_actions)  # [1800, N*2]
+        all_masks = torch.stack(stored_masks)   # [1800, N*2]
 
         # Process in mini-batches of steps to control memory
         CHUNK = 100
