@@ -222,6 +222,7 @@ async def start_gpu_training(req: GPUTrainRequest):
 
     docker_args = (
         f'bash -c "apt-get update && apt-get install -y git && '
+        f"rm -rf /workspace/hockey && "
         f"git clone https://github.com/SimonBoisclair/hockey-api.git /workspace/hockey && "
         f"cd /workspace/hockey/training && "
         f"BACKEND_URL={BACKEND_PUBLIC_URL} "
