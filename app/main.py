@@ -175,6 +175,7 @@ class TrainingReport(BaseModel):
     eps_per_sec: float
     model_name: str
     status: Optional[str] = None
+    pod_id: Optional[str] = None
 
 
 # GPU types to try in order of preference
@@ -220,16 +221,21 @@ async def start_gpu_training(req: GPUTrainRequest):
     if not RUNPOD_API_KEY:
         raise HTTPException(status_code=500, detail="RUNPOD_API_KEY not configured")
 
+    # Sanitize model name to prevent shell injection
+    safe_model_name = req.model_name.replace("'", "").replace('"', '').replace(';', '').replace('&', '').strip()
+    if not safe_model_name:
+        safe_model_name = "gpu-trained"
+
     docker_args = (
         f'bash -c "apt-get update && apt-get install -y git && '
         f"rm -rf /workspace/hockey && "
         f"git clone https://github.com/SimonBoisclair/hockey-api.git /workspace/hockey && "
         f"cd /workspace/hockey/training && "
-        f"BACKEND_URL={BACKEND_PUBLIC_URL} "
-        f"MODEL_NAME={req.model_name} "
-        f"EPISODES={req.episodes} "
-        f"SAVE_INTERVAL={req.save_interval} "
-        f"NUM_ENVS=16384 "
+        f"export BACKEND_URL={BACKEND_PUBLIC_URL} && "
+        f"export MODEL_NAME='{safe_model_name}' && "
+        f"export EPISODES={req.episodes} && "
+        f"export SAVE_INTERVAL={req.save_interval} && "
+        f"export NUM_ENVS=16384 && "
         f'python train_gpu.py"'
     )
 
@@ -323,6 +329,10 @@ async def stop_gpu_training():
 
 @app.post("/training/report")
 async def report_training_progress(report: TrainingReport):
+    # Only accept reports from the current training pod
+    current_pod = training_status.get("pod_id")
+    if report.pod_id and current_pod and report.pod_id != current_pod:
+        return {"status": "ignored", "reason": "stale pod"}
     training_status.update({
         "status": report.status or "training",
         "episode": report.episode,

@@ -21,6 +21,7 @@ TOTAL_EPISODES = int(os.environ.get('EPISODES', '100000'))
 SAVE_INTERVAL = int(os.environ.get('SAVE_INTERVAL', '1000'))
 REPORT_INTERVAL = int(os.environ.get('REPORT_INTERVAL', '500'))
 MODEL_ID = os.environ.get('MODEL_ID', '')
+POD_ID = os.environ.get('RUNPOD_POD_ID', os.environ.get('POD_ID', ''))
 NUM_ENVS = int(os.environ.get('NUM_ENVS', '16384'))
 
 # ── Physics Constants (matching frontend exactly) ──
@@ -679,6 +680,7 @@ def main():
                     "episode": total_ep, "total_episodes": TOTAL_EPISODES,
                     "blue_wins": blue_wins, "red_wins": red_wins, "draws": draws,
                     "eps_per_sec": round(eps, 1), "model_name": MODEL_NAME,
+                    "pod_id": POD_ID,
                 })
             except Exception:
                 pass
@@ -727,6 +729,7 @@ def main():
             "episode": TOTAL_EPISODES, "total_episodes": TOTAL_EPISODES,
             "blue_wins": blue_wins, "red_wins": red_wins, "draws": draws,
             "eps_per_sec": 0, "model_name": MODEL_NAME, "status": "completed",
+            "pod_id": POD_ID,
         })
     except Exception:
         pass
@@ -748,6 +751,7 @@ if __name__ == '__main__':
                 "blue_wins": 0, "red_wins": 0, "draws": 0,
                 "eps_per_sec": 0, "model_name": MODEL_NAME,
                 "status": f"error: {str(e)[:500]}",
+                "pod_id": POD_ID,
             })
         except Exception:
             pass
