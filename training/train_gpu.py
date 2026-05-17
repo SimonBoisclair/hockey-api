@@ -736,4 +736,19 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        err_msg = traceback.format_exc()
+        print(f"FATAL ERROR: {err_msg}")
+        try:
+            http_post(f"{BACKEND_URL}/training/report", {
+                "episode": 0, "total_episodes": 0,
+                "blue_wins": 0, "red_wins": 0, "draws": 0,
+                "eps_per_sec": 0, "model_name": MODEL_NAME,
+                "status": f"error: {str(e)[:500]}",
+            })
+        except Exception:
+            pass
+        raise
