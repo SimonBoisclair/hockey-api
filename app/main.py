@@ -215,7 +215,8 @@ async def start_gpu_training(req: GPUTrainRequest):
         f"MODEL_NAME={req.model_name} "
         f"EPISODES={req.episodes} "
         f"SAVE_INTERVAL={req.save_interval} "
-        f'node train.mjs"'
+        f"NUM_ENVS=16384 "
+        f'python train_gpu.py"'
     )
 
     query = """
@@ -224,12 +225,12 @@ async def start_gpu_training(req: GPUTrainRequest):
         cloudType: ALL,
         gpuCount: 1,
         volumeInGb: 0,
-        containerDiskInGb: 10,
-        minVcpuCount: 4,
-        minMemoryInGb: 16,
+        containerDiskInGb: 20,
+        minVcpuCount: 8,
+        minMemoryInGb: 32,
         gpuTypeId: "%s",
         name: "hockey-training",
-        imageName: "node:20",
+        imageName: "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime",
         dockerArgs: "%s",
         ports: "8080/http"
       }) {
