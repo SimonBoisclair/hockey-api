@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import httpx
 from datetime import datetime, timezone
 from typing import Optional
@@ -7,6 +6,8 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId
 
 app = FastAPI()
 
@@ -19,37 +20,30 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-DB_DIR = "/data" if os.path.isdir("/data") else os.path.dirname(__file__)
-DB_PATH = os.path.join(DB_DIR, "app.db")
+MONGODB_URI = os.environ.get("MONGODB_URI", "")
+mongo_client: AsyncIOMotorClient = None
+db = None
 
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+@app.on_event("startup")
+async def startup_db():
+    global mongo_client, db
+    if not MONGODB_URI:
+        raise RuntimeError("MONGODB_URI environment variable is required")
+    mongo_client = AsyncIOMotorClient(MONGODB_URI)
+    db = mongo_client["hockey"]
 
 
-def init_db():
-    conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS models (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            weights TEXT NOT NULL,
-            episodes INTEGER DEFAULT 0,
-            blue_wins INTEGER DEFAULT 0,
-            red_wins INTEGER DEFAULT 0,
-            draws INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
+@app.on_event("shutdown")
+async def shutdown_db():
+    if mongo_client:
+        mongo_client.close()
 
 
-init_db()
+def doc_to_dict(doc: dict) -> dict:
+    """Convert MongoDB document to API response (ObjectId -> string id)."""
+    doc["id"] = str(doc.pop("_id"))
+    return doc
 
 
 class ModelCreate(BaseModel):
@@ -77,45 +71,50 @@ async def healthz():
 
 @app.get("/models")
 async def list_models():
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT id, name, episodes, blue_wins, red_wins, draws, created_at, updated_at FROM models ORDER BY updated_at DESC"
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    cursor = db.models.find({}, {"weights": 0}).sort("updated_at", -1)
+    docs = await cursor.to_list(length=1000)
+    return [doc_to_dict(d) for d in docs]
 
 
 @app.get("/models/{model_id}")
-async def get_model(model_id: int):
-    conn = get_db()
-    row = conn.execute("SELECT * FROM models WHERE id = ?", (model_id,)).fetchone()
-    conn.close()
-    if not row:
+async def get_model(model_id: str):
+    try:
+        oid = ObjectId(model_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid model ID")
+    doc = await db.models.find_one({"_id": oid})
+    if not doc:
         raise HTTPException(status_code=404, detail="Model not found")
-    return dict(row)
+    return doc_to_dict(doc)
 
 
 @app.post("/models", status_code=201)
 async def create_model(model: ModelCreate):
     now = datetime.now(timezone.utc).isoformat()
-    conn = get_db()
-    cur = conn.execute(
-        "INSERT INTO models (name, weights, episodes, blue_wins, red_wins, draws, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (model.name, model.weights, model.episodes, model.blue_wins, model.red_wins, model.draws, now, now),
-    )
-    conn.commit()
-    model_id = cur.lastrowid
-    row = conn.execute("SELECT * FROM models WHERE id = ?", (model_id,)).fetchone()
-    conn.close()
-    return dict(row)
+    doc = {
+        "name": model.name,
+        "weights": model.weights,
+        "episodes": model.episodes,
+        "blue_wins": model.blue_wins,
+        "red_wins": model.red_wins,
+        "draws": model.draws,
+        "created_at": now,
+        "updated_at": now,
+    }
+    result = await db.models.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return doc_to_dict(doc)
 
 
 @app.put("/models/{model_id}")
-async def update_model(model_id: int, model: ModelUpdate):
-    conn = get_db()
-    existing = conn.execute("SELECT * FROM models WHERE id = ?", (model_id,)).fetchone()
+async def update_model(model_id: str, model: ModelUpdate):
+    try:
+        oid = ObjectId(model_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid model ID")
+
+    existing = await db.models.find_one({"_id": oid})
     if not existing:
-        conn.close()
         raise HTTPException(status_code=404, detail="Model not found")
 
     now = datetime.now(timezone.utc).isoformat()
@@ -134,25 +133,20 @@ async def update_model(model_id: int, model: ModelUpdate):
         updates["draws"] = model.draws
     updates["updated_at"] = now
 
-    set_clause = ", ".join(f"{k} = ?" for k in updates)
-    values = list(updates.values()) + [model_id]
-    conn.execute(f"UPDATE models SET {set_clause} WHERE id = ?", values)
-    conn.commit()
-    row = conn.execute("SELECT * FROM models WHERE id = ?", (model_id,)).fetchone()
-    conn.close()
-    return dict(row)
+    await db.models.update_one({"_id": oid}, {"$set": updates})
+    doc = await db.models.find_one({"_id": oid})
+    return doc_to_dict(doc)
 
 
 @app.delete("/models/{model_id}")
-async def delete_model(model_id: int):
-    conn = get_db()
-    existing = conn.execute("SELECT id FROM models WHERE id = ?", (model_id,)).fetchone()
-    if not existing:
-        conn.close()
+async def delete_model(model_id: str):
+    try:
+        oid = ObjectId(model_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid model ID")
+    result = await db.models.delete_one({"_id": oid})
+    if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Model not found")
-    conn.execute("DELETE FROM models WHERE id = ?", (model_id,))
-    conn.commit()
-    conn.close()
     return {"status": "deleted"}
 
 
