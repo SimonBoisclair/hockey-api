@@ -177,6 +177,19 @@ class TrainingReport(BaseModel):
     status: Optional[str] = None
 
 
+# GPU types to try in order of preference
+GPU_FALLBACKS = [
+    "NVIDIA A100 80GB PCIe",
+    "NVIDIA A100-SXM4-80GB",
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H100 PCIe",
+    "NVIDIA A40",
+    "NVIDIA RTX A6000",
+    "NVIDIA L40",
+    "NVIDIA RTX 4090",
+]
+
+
 class GPUTrainRequest(BaseModel):
     model_name: str = "gpu-trained"
     episodes: int = 100000
@@ -219,7 +232,7 @@ async def start_gpu_training(req: GPUTrainRequest):
         f'python train_gpu.py"'
     )
 
-    query = """
+    query_template = """
     mutation {
       podFindAndDeployOnDemand(input: {
         cloudType: ALL,
@@ -240,10 +253,31 @@ async def start_gpu_training(req: GPUTrainRequest):
         costPerHr
       }
     }
-    """ % (req.gpu_type, docker_args.replace('"', '\\"'))
+    """
 
-    data = runpod_gql(query)
-    pod = data.get("podFindAndDeployOnDemand", {})
+    # Try requested GPU type first, then fallbacks
+    gpu_types_to_try = [req.gpu_type] + [g for g in GPU_FALLBACKS if g != req.gpu_type]
+    pod = None
+    used_gpu = req.gpu_type
+    last_error = None
+
+    for gpu in gpu_types_to_try:
+        try:
+            attempt_query = query_template % (gpu, docker_args.replace('"', '\\"'))
+            data = runpod_gql(attempt_query)
+            pod = data.get("podFindAndDeployOnDemand", {})
+            if pod and pod.get("id"):
+                used_gpu = gpu
+                break
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    if not pod or not pod.get("id"):
+        raise HTTPException(
+            status_code=503,
+            detail=f"No GPU instances available. Tried: {', '.join(gpu_types_to_try)}. Last error: {last_error}"
+        )
 
     training_status.clear()
     training_status.update({
@@ -265,6 +299,7 @@ async def start_gpu_training(req: GPUTrainRequest):
         "cost_per_hr": pod.get("costPerHr", 0),
         "status": "starting",
         "model_name": req.model_name,
+        "gpu_type": used_gpu,
     }
 
 
