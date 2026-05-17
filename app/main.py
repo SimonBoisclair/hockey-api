@@ -1,6 +1,8 @@
 import os
 import sqlite3
+import httpx
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -152,3 +154,154 @@ async def delete_model(model_id: int):
     conn.commit()
     conn.close()
     return {"status": "deleted"}
+
+
+# ── RunPod Management ──
+
+RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
+RUNPOD_GQL_URL = "https://api.runpod.io/graphql"
+BACKEND_PUBLIC_URL = os.environ.get("BACKEND_URL", "https://hockey-api-zrey.onrender.com")
+
+# In-memory training status (reset on restart, which is fine)
+training_status: dict = {}
+
+
+class TrainingReport(BaseModel):
+    episode: int
+    total_episodes: int
+    blue_wins: int
+    red_wins: int
+    draws: int
+    eps_per_sec: float
+    model_name: str
+    status: Optional[str] = None
+
+
+class GPUTrainRequest(BaseModel):
+    model_name: str = "gpu-trained"
+    episodes: int = 100000
+    save_interval: int = 1000
+    gpu_type: str = "NVIDIA A100 80GB PCIe"
+
+
+def runpod_gql(query: str, variables: dict = None) -> dict:
+    headers = {"Content-Type": "application/json"}
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    resp = httpx.post(
+        f"{RUNPOD_GQL_URL}?api_key={RUNPOD_API_KEY}",
+        json=payload,
+        headers=headers,
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "errors" in data:
+        raise HTTPException(status_code=400, detail=str(data["errors"]))
+    return data.get("data", {})
+
+
+@app.post("/training/start")
+async def start_gpu_training(req: GPUTrainRequest):
+    if not RUNPOD_API_KEY:
+        raise HTTPException(status_code=500, detail="RUNPOD_API_KEY not configured")
+
+    docker_args = (
+        f'bash -c "apt-get update && apt-get install -y git && '
+        f"git clone https://github.com/SimonBoisclair/hockey-api.git /workspace/hockey && "
+        f"cd /workspace/hockey/training && "
+        f"BACKEND_URL={BACKEND_PUBLIC_URL} "
+        f"MODEL_NAME={req.model_name} "
+        f"EPISODES={req.episodes} "
+        f"SAVE_INTERVAL={req.save_interval} "
+        f'node train.mjs"'
+    )
+
+    query = """
+    mutation {
+      podFindAndDeployOnDemand(input: {
+        cloudType: ALL,
+        gpuCount: 1,
+        volumeInGb: 0,
+        containerDiskInGb: 10,
+        minVcpuCount: 4,
+        minMemoryInGb: 16,
+        gpuTypeId: "%s",
+        name: "hockey-training",
+        imageName: "node:20",
+        dockerArgs: "%s",
+        ports: "8080/http"
+      }) {
+        id
+        imageName
+        machineId
+        costPerHr
+      }
+    }
+    """ % (req.gpu_type, docker_args.replace('"', '\\"'))
+
+    data = runpod_gql(query)
+    pod = data.get("podFindAndDeployOnDemand", {})
+
+    training_status.clear()
+    training_status.update({
+        "pod_id": pod.get("id"),
+        "status": "starting",
+        "model_name": req.model_name,
+        "total_episodes": req.episodes,
+        "episode": 0,
+        "blue_wins": 0,
+        "red_wins": 0,
+        "draws": 0,
+        "eps_per_sec": 0,
+        "cost_per_hr": pod.get("costPerHr", 0),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    return {
+        "pod_id": pod.get("id"),
+        "cost_per_hr": pod.get("costPerHr", 0),
+        "status": "starting",
+        "model_name": req.model_name,
+    }
+
+
+@app.post("/training/stop")
+async def stop_gpu_training():
+    pod_id = training_status.get("pod_id")
+    if not pod_id:
+        raise HTTPException(status_code=404, detail="No active training pod")
+
+    query = 'mutation { podTerminate(input: { podId: "%s" }) }' % pod_id
+
+    try:
+        runpod_gql(query)
+    except Exception:
+        pass
+
+    training_status["status"] = "stopped"
+    return {"status": "stopped", "pod_id": pod_id}
+
+
+@app.post("/training/report")
+async def report_training_progress(report: TrainingReport):
+    training_status.update({
+        "status": report.status or "training",
+        "episode": report.episode,
+        "total_episodes": report.total_episodes,
+        "blue_wins": report.blue_wins,
+        "red_wins": report.red_wins,
+        "draws": report.draws,
+        "eps_per_sec": report.eps_per_sec,
+        "model_name": report.model_name,
+        "last_report": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"status": "ok"}
+
+
+@app.get("/training/status")
+async def get_training_status():
+    if not training_status:
+        return {"status": "idle"}
+    return training_status
