@@ -190,6 +190,9 @@ class GPUTrainRequest(BaseModel):
     episodes: int = 100000
     save_interval: int = 1000
     gpu_type: str = "NVIDIA A100 80GB PCIe"
+    level: int | None = None
+    load_model_id: str | None = None
+    compat_mode: bool = False
 
 
 def runpod_gql(query: str, variables: dict = None) -> dict:
@@ -220,6 +223,13 @@ async def start_gpu_training(req: GPUTrainRequest):
     if not safe_model_name:
         safe_model_name = "gpu-trained"
 
+    extra_envs = ""
+    if req.compat_mode:
+        extra_envs += "export COMPAT_MODE=1 && "
+    if req.load_model_id:
+        safe_load_id = req.load_model_id.replace("'", "").replace('"', '').replace(';', '').replace('&', '').strip()
+        extra_envs += f"export LOAD_MODEL_ID='{safe_load_id}' && "
+
     docker_args = (
         f'bash -c "apt-get update && apt-get install -y git && '
         f"rm -rf /workspace/hockey && "
@@ -230,6 +240,7 @@ async def start_gpu_training(req: GPUTrainRequest):
         f"export EPISODES={req.episodes} && "
         f"export SAVE_INTERVAL={req.save_interval} && "
         f"export NUM_ENVS=16384 && "
+        f"{extra_envs}"
         f'python train_gpu.py"'
     )
 
@@ -293,6 +304,7 @@ async def start_gpu_training(req: GPUTrainRequest):
         "eps_per_sec": 0,
         "cost_per_hr": pod.get("costPerHr", 0),
         "started_at": datetime.now(timezone.utc).isoformat(),
+        "level": req.level,
     })
 
     return {
