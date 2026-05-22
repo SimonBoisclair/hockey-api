@@ -783,18 +783,24 @@ def main():
         if total_ep - last_save >= SAVE_INTERVAL:
             last_save = total_ep
             weights = net.serialize_for_frontend()
+            save_data = {
+                "weights": weights, "episodes": total_ep,
+                "blue_wins": blue_wins, "red_wins": red_wins, "draws": draws,
+            }
             try:
                 if model_id:
-                    http_put(f"{BACKEND_URL}/models/{model_id}", {
-                        "weights": weights, "episodes": total_ep,
-                        "blue_wins": blue_wins, "red_wins": red_wins, "draws": draws,
-                    })
-                    print(f"  -> Updated model #{model_id}")
+                    try:
+                        http_put(f"{BACKEND_URL}/models/{model_id}", save_data)
+                        print(f"  -> Updated model #{model_id}")
+                    except Exception:
+                        # Model may have been deleted; fall back to creating new
+                        save_data["name"] = MODEL_NAME
+                        result = http_post(f"{BACKEND_URL}/models", save_data)
+                        model_id = result.get("id")
+                        print(f"  -> Re-created model #{model_id} (PUT failed, fell back to POST)")
                 else:
-                    result = http_post(f"{BACKEND_URL}/models", {
-                        "name": MODEL_NAME, "weights": weights, "episodes": total_ep,
-                        "blue_wins": blue_wins, "red_wins": red_wins, "draws": draws,
-                    })
+                    save_data["name"] = MODEL_NAME
+                    result = http_post(f"{BACKEND_URL}/models", save_data)
                     model_id = result.get("id")
                     print(f"  -> Created model #{model_id}")
             except Exception as e:
@@ -802,17 +808,21 @@ def main():
 
     # ── Final save ──
     weights = net.serialize_for_frontend()
+    final_data = {
+        "weights": weights, "episodes": TOTAL_EPISODES,
+        "blue_wins": blue_wins, "red_wins": red_wins, "draws": draws,
+    }
     try:
         if model_id:
-            http_put(f"{BACKEND_URL}/models/{model_id}", {
-                "weights": weights, "episodes": TOTAL_EPISODES,
-                "blue_wins": blue_wins, "red_wins": red_wins, "draws": draws,
-            })
+            try:
+                http_put(f"{BACKEND_URL}/models/{model_id}", final_data)
+            except Exception:
+                final_data["name"] = MODEL_NAME
+                result = http_post(f"{BACKEND_URL}/models", final_data)
+                model_id = result.get("id")
         else:
-            http_post(f"{BACKEND_URL}/models", {
-                "name": MODEL_NAME, "weights": weights, "episodes": TOTAL_EPISODES,
-                "blue_wins": blue_wins, "red_wins": red_wins, "draws": draws,
-            })
+            final_data["name"] = MODEL_NAME
+            http_post(f"{BACKEND_URL}/models", final_data)
         print(f"\nTraining complete! Final model saved.")
     except Exception as e:
         print(f"Final save failed: {e}")
