@@ -50,8 +50,11 @@ DT = 1.0 / 60.0
 GOAL_DISPLAY = 0.05  # minimal for training (instant reset)
 
 # ── AI Constants ──
-NUM_FEATURES = 20
+COMPAT_MODE = os.environ.get('COMPAT_MODE', '') == '1'
+LOAD_MODEL_ID = os.environ.get('LOAD_MODEL_ID', '')
+NUM_FEATURES = 13 if COMPAT_MODE else 20
 NUM_ACTIONS = 10
+NETWORK_SIZES = [13, 64, 32, 10] if COMPAT_MODE else [20, 512, 512, 256, 128, 10]
 DECISION_BUDGET = 5.0
 BUDGET_WINDOW = 600.0
 BUDGET_REFILL = DECISION_BUDGET / BUDGET_WINDOW
@@ -158,7 +161,7 @@ class VecHockeyEnv:
         return chance
 
     def get_obs(self):
-        """Return observations [N, 2, 20] for both players."""
+        """Return observations [N, 2, NUM_FEATURES] for both players."""
         obs = torch.zeros(self.N, 2, NUM_FEATURES, device=device)
         goal_x = RINK_W - GOAL_D / 2
         goal_y = RINK_H / 2
@@ -181,23 +184,16 @@ class VecHockeyEnv:
             obs[:, pi, 10] = (goal_x - me_p[:, 0]) / RINK_W
             obs[:, pi, 11] = (goal_y - me_p[:, 1]) / RINK_H
             obs[:, pi, 12] = torch.norm(me_p - op_p, dim=-1) / RINK_W
-            # New features
-            # Destination (use current pos if no destination)
-            has_d = self.has_dest[:, pi].float()
-            obs[:, pi, 13] = torch.where(self.has_dest[:, pi],
-                self.dest[:, pi, 0] / RINK_W, me_p[:, 0] / RINK_W)
-            obs[:, pi, 14] = torch.where(self.has_dest[:, pi],
-                self.dest[:, pi, 1] / RINK_H, me_p[:, 1] / RINK_H)
-            # Decision budget (normalized)
-            obs[:, pi, 15] = self.tokens[:, pi] / DECISION_BUDGET
-            # isLocked
-            obs[:, pi, 16] = self.lock_dir[:, pi].float()
-            # Steal chance
-            obs[:, pi, 17] = self._compute_steal_chance(pi)
-            # Opponent hasPuck
-            obs[:, pi, 18] = (self.poss != pi).float()
-            # Opponent isLocked
-            obs[:, pi, 19] = self.lock_dir[:, oi].float()
+            if not COMPAT_MODE:
+                obs[:, pi, 13] = torch.where(self.has_dest[:, pi],
+                    self.dest[:, pi, 0] / RINK_W, me_p[:, 0] / RINK_W)
+                obs[:, pi, 14] = torch.where(self.has_dest[:, pi],
+                    self.dest[:, pi, 1] / RINK_H, me_p[:, 1] / RINK_H)
+                obs[:, pi, 15] = self.tokens[:, pi] / DECISION_BUDGET
+                obs[:, pi, 16] = self.lock_dir[:, pi].float()
+                obs[:, pi, 17] = self._compute_steal_chance(pi)
+                obs[:, pi, 18] = (self.poss != pi).float()
+                obs[:, pi, 19] = self.lock_dir[:, oi].float()
         return obs
 
     def apply_actions(self, actions, can_decide):
@@ -526,35 +522,49 @@ class VecHockeyEnv:
 # ══════════════════════════════════════════════════════════════
 
 class PolicyNet(nn.Module):
-    def __init__(self):
+    def __init__(self, sizes=None):
         super().__init__()
-        self.fc1 = nn.Linear(NUM_FEATURES, 512)
-        self.fc2 = nn.Linear(512, 512)
-        self.fc3 = nn.Linear(512, 256)
-        self.fc4 = nn.Linear(256, 128)
-        self.fc5 = nn.Linear(128, NUM_ACTIONS)
+        if sizes is None:
+            sizes = NETWORK_SIZES
+        self.fcs = nn.ModuleList()
+        for i in range(len(sizes) - 1):
+            self.fcs.append(nn.Linear(sizes[i], sizes[i + 1]))
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = F.relu(self.fc4(x))
-        return F.softmax(self.fc5(x), dim=-1)
+        for i, fc in enumerate(self.fcs):
+            x = fc(x)
+            if i < len(self.fcs) - 1:
+                x = F.relu(x)
+        return F.softmax(x, dim=-1)
 
     def serialize_for_frontend(self):
         """Serialize weights in the same JSON format the frontend expects."""
         layers = []
-        for layer in [self.fc1, self.fc2, self.fc3, self.fc4, self.fc5]:
+        for fc in self.fcs:
             layers.append({
-                "weights": layer.weight.detach().cpu().tolist(),
-                "biases": layer.bias.detach().cpu().tolist(),
+                "weights": fc.weight.detach().cpu().tolist(),
+                "biases": fc.bias.detach().cpu().tolist(),
             })
         return json.dumps(layers)
+
+    def load_from_frontend(self, json_str):
+        """Load weights from frontend JSON format."""
+        data = json.loads(json_str)
+        for i, layer_data in enumerate(data):
+            if i < len(self.fcs):
+                self.fcs[i].weight.data = torch.tensor(layer_data['weights'], dtype=torch.float32, device=device)
+                self.fcs[i].bias.data = torch.tensor(layer_data['biases'], dtype=torch.float32, device=device)
 
 
 # ══════════════════════════════════════════════════════════════
 # HTTP helpers
 # ══════════════════════════════════════════════════════════════
+
+def http_get(url):
+    req = urllib.request.Request(url, method='GET')
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return json.loads(resp.read())
+
 
 def http_post(url, data):
     body = json.dumps(data).encode()
@@ -590,10 +600,27 @@ def main():
     print(f"Model: {MODEL_NAME}")
     print(f"Total episodes: {TOTAL_EPISODES}")
     print(f"Save every: {SAVE_INTERVAL}")
+    print(f"Compat mode: {COMPAT_MODE}")
+    print(f"Network: {NETWORK_SIZES}")
+    if LOAD_MODEL_ID:
+        print(f"Loading weights from model: {LOAD_MODEL_ID}")
     print()
 
     env = VecHockeyEnv(N)
     net = PolicyNet().to(device)
+
+    # Load weights from existing model if specified
+    if LOAD_MODEL_ID:
+        try:
+            model_data = http_get(f"{BACKEND_URL}/models/{LOAD_MODEL_ID}")
+            if model_data.get('weights'):
+                net.load_from_frontend(model_data['weights'])
+                print(f"Loaded weights from model {LOAD_MODEL_ID} ({model_data.get('name', '?')})")
+            else:
+                print(f"Warning: Model {LOAD_MODEL_ID} has no weights, starting fresh")
+        except Exception as e:
+            print(f"Warning: Failed to load model {LOAD_MODEL_ID}: {e}, starting fresh")
+
     optimizer = torch.optim.Adam(net.parameters(), lr=LR)
 
     total_ep = 0
