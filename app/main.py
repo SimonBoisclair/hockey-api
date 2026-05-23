@@ -247,7 +247,7 @@ async def start_gpu_training(req: GPUTrainRequest):
     query_template = """
     mutation {
       podFindAndDeployOnDemand(input: {
-        cloudType: ALL,
+        cloudType: SECURE,
         gpuCount: 1,
         volumeInGb: 0,
         containerDiskInGb: 20,
